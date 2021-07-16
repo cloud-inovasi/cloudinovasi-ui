@@ -2,6 +2,7 @@ package stacks
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -12,64 +13,32 @@ import (
 	"github.com/portainer/libhttp/response"
 	portainer "github.com/portainer/portainer/api"
 	bolterrors "github.com/portainer/portainer/api/bolt/errors"
-	gittypes "github.com/portainer/portainer/api/git/types"
+	"github.com/portainer/portainer/api/filesystem"
 	httperrors "github.com/portainer/portainer/api/http/errors"
 	"github.com/portainer/portainer/api/http/security"
 	"github.com/portainer/portainer/api/internal/stackutils"
-	"github.com/portainer/portainer/api/stacks"
 )
 
-type stackGitUpdatePayload struct {
-	AutoUpdate               *portainer.StackAutoUpdate
-	Env                      []portainer.Pair
+type stackGitRedployPayload struct {
 	RepositoryReferenceName  string
 	RepositoryAuthentication bool
 	RepositoryUsername       string
 	RepositoryPassword       string
+	Env                      []portainer.Pair
 }
 
-func (payload *stackGitUpdatePayload) Validate(r *http.Request) error {
-	if govalidator.IsNull(payload.RepositoryReferenceName) {
-		return errors.New("Invalid RepositoryReferenceName")
-	}
-	if govalidator.IsNull(payload.RepositoryReferenceName) {
-		payload.RepositoryReferenceName = defaultGitReferenceName
-	}
-	if payload.RepositoryAuthentication && govalidator.IsNull(payload.RepositoryPassword) {
-		return errors.New("Invalid repository credentials. Password must be specified when authentication is enabled")
-	}
-	if err := validateStackAutoUpdate(payload.AutoUpdate); err != nil {
-		return err
+func (payload *stackGitRedployPayload) Validate(r *http.Request) error {
+	if payload.RepositoryAuthentication && (govalidator.IsNull(payload.RepositoryUsername) || govalidator.IsNull(payload.RepositoryPassword)) {
+		return errors.New("Invalid repository credentials. Username and password must be specified when authentication is enabled")
 	}
 	return nil
 }
 
-// @id Stacks
-// @summary Update and redeploy an existing stack (with Git config)
-// @description  Update and redeploy an existing stack (with Git config)
-// @description **Access policy**: authenticated
-// @tags stacks
-// @security jwt
-// @produce json
-// @param id path int true "Stack identifier"
-// @param endpointId query int false "Stacks created before version 1.18.0 might not have an associated endpoint identifier. Use this optional parameter to set the endpoint identifier used by the stack."
-// @param body body stackGitUpdatePayload true "Stack Git config"
-// @success 200 {object} portainer.Stack "Success"
-// @failure 400 "Invalid request"
-// @failure 403 "Permission denied"
-// @failure 404 "Not found"
-// @failure 500 "Server error"
-// @router /stacks/{id}/git
-func (handler *Handler) stackGitUpdate(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
+// PUT request on /api/stacks/:id/git?endpointId=<endpointId>
+func (handler *Handler) stackGitRedeploy(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
 	stackID, err := request.RetrieveNumericRouteVariableValue(r, "id")
 	if err != nil {
 		return &httperror.HandlerError{StatusCode: http.StatusBadRequest, Message: "Invalid stack identifier route variable", Err: err}
-	}
-
-	var payload stackGitUpdatePayload
-	err = request.DecodeAndValidateJSONPayload(r, &payload)
-	if err != nil {
-		return &httperror.HandlerError{StatusCode: http.StatusBadRequest, Message: "Invalid request payload", Err: err}
 	}
 
 	stack, err := handler.DataStore.Stack().Stack(portainer.StackID(stackID))
@@ -77,9 +46,10 @@ func (handler *Handler) stackGitUpdate(w http.ResponseWriter, r *http.Request) *
 		return &httperror.HandlerError{StatusCode: http.StatusNotFound, Message: "Unable to find a stack with the specified identifier inside the database", Err: err}
 	} else if err != nil {
 		return &httperror.HandlerError{StatusCode: http.StatusInternalServerError, Message: "Unable to find a stack with the specified identifier inside the database", Err: err}
-	} else if stack.GitConfig == nil {
-		msg := "No Git config in the found stack"
-		return &httperror.HandlerError{StatusCode: http.StatusInternalServerError, Message: msg, Err: errors.New(msg)}
+	}
+
+	if stack.GitConfig == nil {
+		return &httperror.HandlerError{StatusCode: http.StatusBadRequest, Message: "Stack is not created from git", Err: err}
 	}
 
 	// TODO: this is a work-around for stacks created with Portainer version >= 1.17.1
@@ -123,47 +93,90 @@ func (handler *Handler) stackGitUpdate(w http.ResponseWriter, r *http.Request) *
 		return &httperror.HandlerError{StatusCode: http.StatusForbidden, Message: "Access denied to resource", Err: httperrors.ErrResourceAccessDenied}
 	}
 
-	//stop the autoupdate job if there is any
-	if stack.AutoUpdate != nil && stack.AutoUpdate.JobID != "" {
-		handler.Scheduler.StopJob(stack.AutoUpdate.JobID)
+	var payload stackGitRedployPayload
+	err = request.DecodeAndValidateJSONPayload(r, &payload)
+	if err != nil {
+		return &httperror.HandlerError{StatusCode: http.StatusBadRequest, Message: "Invalid request payload", Err: err}
 	}
 
-	//update retrieved stack data based on the payload
 	stack.GitConfig.ReferenceName = payload.RepositoryReferenceName
-	stack.AutoUpdate = payload.AutoUpdate
 	stack.Env = payload.Env
 
-	if payload.RepositoryAuthentication {
-		stack.GitConfig.Authentication = &gittypes.GitAuthentication{
-			Username: payload.RepositoryUsername,
-			Password: payload.RepositoryPassword,
-		}
-	} else {
-		stack.GitConfig.Authentication = &gittypes.GitAuthentication{
-			Username: "",
-			Password: "",
-		}
+	backupProjectPath := fmt.Sprintf("%s-old", stack.ProjectPath)
+	err = filesystem.MoveDirectory(stack.ProjectPath, backupProjectPath)
+	if err != nil {
+		return &httperror.HandlerError{StatusCode: http.StatusInternalServerError, Message: "Unable to move git repository directory", Err: err}
 	}
 
-	if payload.AutoUpdate != nil && payload.AutoUpdate.Interval != "" {
-		d, err := time.ParseDuration(payload.AutoUpdate.Interval)
+	repositoryUsername := payload.RepositoryUsername
+	repositoryPassword := payload.RepositoryPassword
+	if !payload.RepositoryAuthentication {
+		repositoryUsername = ""
+		repositoryPassword = ""
+	}
+
+	err = handler.GitService.CloneRepository(stack.ProjectPath, stack.GitConfig.URL, payload.RepositoryReferenceName, repositoryUsername, repositoryPassword)
+	if err != nil {
+		restoreError := filesystem.MoveDirectory(backupProjectPath, stack.ProjectPath)
+		if restoreError != nil {
+			log.Printf("[WARN] [http,stacks,git] [error: %s] [message: failed restoring backup folder]", restoreError)
+		}
+
+		return &httperror.HandlerError{StatusCode: http.StatusInternalServerError, Message: "Unable to clone git repository", Err: err}
+	}
+
+	defer func() {
+		err = handler.FileService.RemoveDirectory(backupProjectPath)
 		if err != nil {
-			return &httperror.HandlerError{StatusCode: http.StatusBadRequest, Message: "Unable to parse auto update interval", Err: err}
+			log.Printf("[WARN] [http,stacks,git] [error: %s] [message: unable to remove git repository directory]", err)
 		}
-		jobID := handler.Scheduler.StartJobEvery(d, func() {
-			if err := stacks.RedeployWhenChanged(stack.ID, handler.StackDeployer, handler.DataStore, handler.GitService); err != nil {
-				log.Printf("[ERROR] %s\n", err)
-			}
-		})
+	}()
 
-		stack.AutoUpdate.JobID = jobID
+	httpErr := handler.deployStack(r, stack, endpoint)
+	if httpErr != nil {
+		return httpErr
 	}
 
-	//save the updated stack to DB
 	err = handler.DataStore.Stack().UpdateStack(stack.ID, stack)
 	if err != nil {
 		return &httperror.HandlerError{StatusCode: http.StatusInternalServerError, Message: "Unable to persist the stack changes inside the database", Err: err}
 	}
 
 	return response.JSON(w, stack)
+}
+
+func (handler *Handler) deployStack(r *http.Request, stack *portainer.Stack, endpoint *portainer.Endpoint) *httperror.HandlerError {
+	if stack.Type == portainer.DockerSwarmStack {
+		config, httpErr := handler.createSwarmDeployConfig(r, stack, endpoint, false)
+		if httpErr != nil {
+			return httpErr
+		}
+
+		err := handler.deploySwarmStack(config)
+		if err != nil {
+			return &httperror.HandlerError{StatusCode: http.StatusInternalServerError, Message: err.Error(), Err: err}
+		}
+
+		stack.UpdateDate = time.Now().Unix()
+		stack.UpdatedBy = config.user.Username
+		stack.Status = portainer.StackStatusActive
+
+		return nil
+	}
+
+	config, httpErr := handler.createComposeDeployConfig(r, stack, endpoint)
+	if httpErr != nil {
+		return httpErr
+	}
+
+	err := handler.deployComposeStack(config)
+	if err != nil {
+		return &httperror.HandlerError{StatusCode: http.StatusInternalServerError, Message: err.Error(), Err: err}
+	}
+
+	stack.UpdateDate = time.Now().Unix()
+	stack.UpdatedBy = config.user.Username
+	stack.Status = portainer.StackStatusActive
+
+	return nil
 }
